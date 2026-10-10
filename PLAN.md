@@ -77,8 +77,9 @@ pi-relay-tui/
 
 - [x] M0：建仓 + 方案冻结
 - [x] M1：`/relay /relay-add /relay-list /relay-use /relay-del /relay-test` 实现 + 类型检查 + headless 功能测试（见 test/）
-- [ ] M1-verify：真机 `pi --extension` 走一遍向导 + `/model` 能选到（等你验证）
-- [ ] M2：`edit`（改 baseUrl/key/模型）、`/models` 发现、失败重试指引 polish
+- [x] M1-verify：真机 `pi --extension` 走通（用户确认可用，反馈“过程繁琐、无自动获取”）
+- [x] M2：`/models` 自动拉取 + 向导瘦身（Key 一次输入自动识别、上次地址复用、模型编辑器确认）+ `/relay-test` 复用同一拉取逻辑
+- [ ] M3：`edit`（改 baseUrl/key/模型）、`pi install git:` 发布验证
 - [ ] M3：`pi install git:...` 发布验证 + README 录屏
 - [ ] M4（可选）：转方案 B（动态注册 + `/models` 发现 + auth.json 联动）
 

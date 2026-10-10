@@ -2,6 +2,7 @@
 import { register } from "node:module";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -45,13 +46,14 @@ function makePi() {
 	};
 }
 
-/** uiQueue: { inputs: Array<string|null>, selects: number[], confirms: boolean[] } */
+/** uiQueue: { inputs: Array<string|null>, selects: number[], confirms: boolean[], editor: Array<string|null> } */
 function makeCtx(pi, { mode = "tui", uiQueue = {}, registryModels = [] } = {}) {
 	const log = [];
 	const q = {
 		inputs: [...(uiQueue.inputs ?? [])],
 		selects: [...(uiQueue.selects ?? [])],
 		confirms: [...(uiQueue.confirms ?? [])],
+		editor: [...(uiQueue.editor ?? [])],
 	};
 	return {
 		ctx: {
@@ -72,6 +74,11 @@ function makeCtx(pi, { mode = "tui", uiQueue = {}, registryModels = [] } = {}) {
 				},
 				notify(message, type) {
 					log.push({ message, type });
+				},
+				async editor(_title, prefill) {
+					const v = q.editor.shift();
+					if (v === null) return undefined;
+					return v ?? prefill ?? "";
 				},
 				setStatus(k, v) {
 					log.push({ status: `${k}=${v}` });
@@ -176,16 +183,63 @@ await ok("坏 models.json 读出空骨架", async () => {
 	assert.deepEqual(relay.loadModelsFile(dir), { providers: {} });
 });
 
-// ================= 5. TUI 向导新增（env key） =================
-await ok("TUI 向导新增 env key", async () => {
+// ================= 5. 本地中转桩（/models 自动拉取） =================
+const stub = createServer((req, res) => {
+	const url = new URL(req.url, "http://x");
+	if (url.pathname === "/v1/models") {
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end(JSON.stringify({ data: [{ id: "auto-1" }, { id: "auto-2" }] }));
+	} else if (url.pathname === "/gemini/models") {
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end(JSON.stringify({ models: [{ name: "models/gem-1" }] }));
+	} else if (url.pathname === "/empty/models") {
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end(JSON.stringify({ data: [] }));
+	} else {
+		res.writeHead(404);
+		res.end("nope");
+	}
+});
+await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+const stubBase = `http://127.0.0.1:${stub.address().port}`;
+
+await ok("fetchModelIds 拉取 OpenAI 格式", async () => {
+	const r = await relay.fetchModelIds(`${stubBase}/v1`, "openai-completions", "k");
+	assert.equal(r.ok, true);
+	assert.deepEqual(r.ids, ["auto-1", "auto-2"]);
+});
+
+await ok("fetchModelIds 解析 Gemini 格式", async () => {
+	const r = await relay.fetchModelIds(`${stubBase}/gemini`, "google-generative-ai", "k");
+	assert.equal(r.ok, true);
+	assert.deepEqual(r.ids, ["gem-1"]);
+});
+
+await ok("fetchModelIds 404 失败", async () => {
+	const r = await relay.fetchModelIds(`${stubBase}/nope`, "openai-completions", "k");
+	assert.equal(r.ok, false);
+	assert.match(r.error, /404/);
+});
+
+await ok("normalizeApiKeyInput 自动识别", async () => {
+	assert.equal(relay.normalizeApiKeyInput("$MY_KEY").key, "$MY_KEY");
+	assert.equal(relay.normalizeApiKeyInput("${MY_KEY}").key, "${MY_KEY}");
+	assert.ok(relay.normalizeApiKeyInput("$1bad").error);
+	assert.equal(relay.normalizeApiKeyInput("!echo hi").key, "!echo hi");
+	assert.equal(relay.normalizeApiKeyInput("plain-123").key, "plain-123");
+	assert.ok(relay.normalizeApiKeyInput("  ").error);
+});
+
+await ok("TUI 向导：自动拉取 + env key", async () => {
 	const dir = freshDir();
 	const pi = makePi();
 	relay.default(pi);
-	// selects: api 选第 0 个；key 方式选第 0 个(env)；最后 confirm 由 confirms 控制
+	// inputs: 名字 / baseUrl / key；selects: api 第 0 个；editor 空=直接用拉取结果；confirms: 保存确认
 	const { ctx } = makeCtx(pi, {
 		uiQueue: {
-			inputs: ["wiz", "https://w.example/v1", "MY_WIZ_KEY", "m1, m2"],
-			selects: [0, 0],
+			inputs: ["wiz", `${stubBase}/v1`, "$MY_WIZ_KEY"],
+			selects: [0],
+			editor: [],
 			confirms: [true],
 		},
 	});
@@ -194,6 +248,26 @@ await ok("TUI 向导新增 env key", async () => {
 	assert.equal(file.providers["relay-wiz"].apiKey, "$MY_WIZ_KEY");
 	assert.deepEqual(
 		file.providers["relay-wiz"].models.map((m) => m.id),
+		["auto-1", "auto-2"],
+	);
+	assert.equal(relay.loadRelayState(dir).lastBaseUrl, `${stubBase}/v1`);
+});
+
+await ok("TUI 向导：拉取失败回落手动", async () => {
+	const dir = freshDir();
+	const pi = makePi();
+	relay.default(pi);
+	const { ctx, log } = makeCtx(pi, {
+		uiQueue: {
+			inputs: ["fb", "http://127.0.0.1:1", "plain-key-123", "m1,m2"],
+			selects: [0],
+			confirms: [true, true],
+		},
+	});
+	await pi.commands["relay-add"].handler("", ctx);
+	assert.ok(log.some((l) => l.message.includes("自动获取失败")));
+	assert.deepEqual(
+		readModels(dir).providers["relay-fb"].models.map((m) => m.id),
 		["m1", "m2"],
 	);
 });
@@ -256,4 +330,5 @@ await ok("非法 api 抛错", async () => {
 	);
 });
 
+stub.close();
 console.log(`\nALL PASS (${passed})`);

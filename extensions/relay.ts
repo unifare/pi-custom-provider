@@ -138,6 +138,37 @@ export function modelsFilePath(agentDir?: string): string {
 	return join(agentDir ?? getAgentDir(), MODELS_FILE);
 }
 
+export interface RelayState {
+	lastBaseUrl?: string;
+	lastApi?: string;
+}
+
+export function stateFilePath(agentDir?: string): string {
+	return join(agentDir ?? getAgentDir(), "relay-state.json");
+}
+
+/** 上次用过的 baseUrl/api（失败/不存在返回空对象，不抛）。 */
+export function loadRelayState(agentDir?: string): RelayState {
+	try {
+		const p = stateFilePath(agentDir);
+		if (!existsSync(p)) return {};
+		const parsed = JSON.parse(readFileSync(p, "utf-8")) as RelayState;
+		return typeof parsed === "object" && parsed !== null ? parsed : {};
+	} catch {
+		return {};
+	}
+}
+
+export function saveRelayState(state: RelayState, agentDir?: string): void {
+	try {
+		const dir = agentDir ?? getAgentDir();
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(stateFilePath(dir), `${JSON.stringify(state, null, 2)}\n`, "utf-8");
+	} catch {
+		// 状态存不住不影响主流程
+	}
+}
+
 /** 读 models.json（不存在/坏掉时返回空骨架，不抛）。 */
 export function loadModelsFile(agentDir?: string): ModelsFileShape {
 	const path = modelsFilePath(agentDir);
@@ -234,6 +265,69 @@ export function registerDynamic(pi: ExtensionAPI, id: string, entry: RelayProvid
 	}
 }
 
+export interface FetchedModels {
+	ok: boolean;
+	ids: string[];
+	error?: string;
+}
+
+function extractIds(data: unknown): string[] {
+	if (!data || typeof data !== "object") return [];
+	const rec = data as Record<string, unknown>;
+	// OpenAI 兼容：{ data: [{ id }] }
+	if (Array.isArray(rec.data)) {
+		const ids: string[] = [];
+		for (const item of rec.data) {
+			if (item && typeof item === "object" && typeof (item as { id?: unknown }).id === "string") {
+				const id = (item as { id: string }).id.trim();
+				if (id && !ids.includes(id)) ids.push(id);
+			}
+		}
+		if (ids.length > 0) return ids;
+	}
+	// Gemini：{ models: [{ name: "models/xxx" }] }
+	if (Array.isArray(rec.models)) {
+		const ids: string[] = [];
+		for (const item of rec.models) {
+			if (item && typeof item === "object" && typeof (item as { name?: unknown }).name === "string") {
+				const id = (item as { name: string }).name.replace(/^models\//, "").trim();
+				if (id && !ids.includes(id)) ids.push(id);
+			}
+		}
+		if (ids.length > 0) return ids;
+	}
+	return [];
+}
+
+/**
+ * 自动拉取中转的模型列表。
+ * OpenAI 兼容：GET {baseUrl}/models；Google 系追加 ?key= 尝试。Anthropic 兼容一般无此端点，调用方回落手动填写。
+ */
+export async function fetchModelIds(baseUrl: string, api: string, apiKey?: string): Promise<FetchedModels> {
+	const key = resolveKeyForTest(apiKey);
+	const base = baseUrl.replace(/\/+$/, "");
+	const headers: Record<string, string> = {};
+	if (key) headers["Authorization"] = `Bearer ${key}`;
+	const attempts = [`${base}/models`];
+	if (api.startsWith("google-") && key) attempts.push(`${base}/models?key=${encodeURIComponent(key)}`);
+	let lastError = "unknown";
+	for (const url of attempts) {
+		try {
+			const res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+			if (!res.ok) {
+				lastError = `HTTP ${res.status}`;
+			continue;
+			}
+			const ids = extractIds(await res.json());
+			if (ids.length > 0) return { ok: true, ids };
+			lastError = "响应中没有模型";
+		} catch (err) {
+			lastError = err instanceof Error ? err.message : String(err);
+		}
+	}
+	return { ok: false, ids: [], error: lastError };
+}
+
 /** 仅 $ENV 引用可解析；明文直接用；!command 不解析（测试时跳过鉴权头）。 */
 export function resolveKeyForTest(key: string | undefined): string | undefined {
 	if (!key) return undefined;
@@ -268,9 +362,12 @@ async function inputOrAbort(
 	return value.trim();
 }
 
-async function pickApi(ctx: ExtensionCommandContext): Promise<string | undefined> {
-	const options = API_CHOICES.map((c) => `${c.value} — ${c.hint}`);
-	const picked = await ctx.ui.select("选择接口类型", options);
+async function pickApi(ctx: ExtensionCommandContext, lastApi?: string): Promise<string | undefined> {
+	const ordered = [...API_CHOICES].sort((a, b) =>
+		a.value === lastApi ? -1 : b.value === lastApi ? 1 : 0,
+	);
+	const options = ordered.map((c) => `${c.value} — ${c.hint}`);
+	const picked = await ctx.ui.select("选择接口类型（回车即第一个）", options);
 	if (!picked) {
 		ctx.ui.notify("已取消。", "info");
 		return undefined;
@@ -278,39 +375,41 @@ async function pickApi(ctx: ExtensionCommandContext): Promise<string | undefined
 	return picked.split(" — ")[0];
 }
 
+/**
+ * Key 一次输完，自动识别：$开头=环境变量，!开头=命令，其他=明文（二次确认）。
+ * Exported 供参数式复用校验。
+ */
+export function normalizeApiKeyInput(raw: string): { key?: string; error?: string } {
+	const value = raw.trim();
+	if (!value) return { error: "Key 为空" };
+	if (value.startsWith("$")) {
+		const name = value.startsWith("${") ? value.slice(2, -1) : value.slice(1);
+		if (!isValidEnvName(name)) return { error: `非法的环境变量名：${value}` };
+		return { key: value };
+	}
+	if (value.startsWith("!")) {
+		if (value.length < 2 || !value.slice(1).trim()) return { error: "命令为空" };
+		return { key: value };
+	}
+	return { key: value };
+}
+
 async function inputApiKey(ctx: ExtensionCommandContext): Promise<string | undefined> {
-	const kind = await ctx.ui.select("API Key 保存方式", [
-		"env — 引用环境变量（推荐，如 $MY_RELAY_KEY）",
-		"plain — 直接填写明文（落盘到 models.json）",
-		"cmd — 命令输出（!command，请求时执行）",
-	]);
-	if (!kind) {
-		ctx.ui.notify("已取消。", "info");
+	const raw = await inputOrAbort(ctx, "API Key", "$MY_RELAY_KEY（$开头=环境变量，!开头=命令，其他按明文存）");
+	if (!raw) return undefined;
+	const parsed = normalizeApiKeyInput(raw);
+	if (!parsed.key) {
+		ctx.ui.notify(parsed.error ?? "Key 非法", "error");
 		return undefined;
 	}
-	const mode = kind.split(" — ")[0];
-	if (mode === "env") {
-		const name = await inputOrAbort(ctx, "环境变量名", "MY_RELAY_KEY");
-		if (!name) return undefined;
-		if (!isValidEnvName(name)) {
-			ctx.ui.notify(`非法的环境变量名：${name}`, "error");
+	if (!raw.startsWith("$") && !raw.startsWith("!")) {
+		const ok = await ctx.ui.confirm("确认保存明文？", `该 key 将明文写入 ${modelsFilePath()}。\n建议改用 $ENV 引用。继续吗？`);
+		if (!ok) {
+			ctx.ui.notify("已取消。", "info");
 			return undefined;
 		}
-		return `$${name}`;
 	}
-	if (mode === "cmd") {
-		const cmd = await inputOrAbort(ctx, "取 Key 的命令", "op read ux-key --no-newline");
-		if (!cmd) return undefined;
-		return cmd.startsWith("!") ? cmd : `!${cmd}`;
-	}
-	const plain = await inputOrAbort(ctx, "API Key 明文", "sk-...");
-	if (!plain) return undefined;
-	const ok = await ctx.ui.confirm("确认保存明文？", `该 key 将明文写入 ${modelsFilePath()}。\n建议改用 env 引用。继续吗？`);
-	if (!ok) {
-		ctx.ui.notify("已取消。", "info");
-		return undefined;
-	}
-	return plain;
+	return parsed.key;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,28 +438,69 @@ async function wizardAdd(ctx: ExtensionCommandContext): Promise<RelayDraft | und
 		return undefined;
 	}
 
-	const rawUrl = await inputOrAbort(ctx, "Base URL", "https://api.example.com/v1");
-	if (!rawUrl) return undefined;
-	const baseUrl = normalizeBaseUrl(rawUrl);
+	const remembered = loadRelayState();
+	let baseUrl: string;
+	if (remembered.lastBaseUrl) {
+		const choice = await ctx.ui.select("Base URL", [`沿用上次：${remembered.lastBaseUrl}`, "输入新的…"]);
+		if (!choice) {
+			ctx.ui.notify("已取消。", "info");
+			return undefined;
+		}
+		if (choice.startsWith("沿用上次：")) {
+			baseUrl = remembered.lastBaseUrl;
+		} else {
+			const rawUrl = await inputOrAbort(ctx, "Base URL", "https://api.example.com/v1");
+			if (!rawUrl) return undefined;
+			baseUrl = normalizeBaseUrl(rawUrl);
+		}
+	} else {
+		const rawUrl = await inputOrAbort(ctx, "Base URL", "https://api.example.com/v1");
+		if (!rawUrl) return undefined;
+		baseUrl = normalizeBaseUrl(rawUrl);
+	}
 	if (!isValidBaseUrl(baseUrl)) {
 		ctx.ui.notify(`URL 不合法：${baseUrl}`, "error");
 		return undefined;
 	}
 
-	const api = await pickApi(ctx);
+	const api = await pickApi(ctx, remembered.lastApi);
 	if (!api) return undefined;
 
 	const apiKey = await inputApiKey(ctx);
 	if (!apiKey) return undefined;
 
-	const rawModels = await inputOrAbort(ctx, "模型 ID（逗号分隔）", "gpt-5.4, claude-sonnet-4-6");
-	if (!rawModels) return undefined;
-	const modelIds = parseModelIds(rawModels);
+	// 自动拉取模型列表，拉到后用多行编辑器确认（可删减增补），拉不到回落手动填写
+	let modelIds: string[];
+	if (ctx.mode === "tui") ctx.ui.notify("正在拉取模型列表…", "info");
+	const fetched = await fetchModelIds(baseUrl, api, apiKey);
+	if (fetched.ok && fetched.ids.length > 0) {
+		if (ctx.mode !== "tui") {
+			modelIds = fetched.ids;
+		} else {
+			const edited = await ctx.ui.editor("确认模型列表（一行一个，回车提交）", fetched.ids.join("\n"));
+			if (edited === undefined) {
+				ctx.ui.notify("已取消。", "info");
+				return undefined;
+			}
+			modelIds = parseModelIds(edited);
+		}
+	} else {
+		if (ctx.mode === "tui") {
+			ctx.ui.notify(`自动获取失败（${fetched.error ?? "无数据"}），请手动填写。`, "warning");
+			const rawModels = await inputOrAbort(ctx, "模型 ID（逗号分隔）", "gpt-5.4, claude-sonnet-4-6");
+			if (!rawModels) return undefined;
+			modelIds = parseModelIds(rawModels);
+		} else {
+		ctx.ui.notify(`自动获取失败（${fetched.error ?? "无数据"}），请用 --models 参数指定。`, "error");
+		return undefined;
+		}
+	}
 	if (modelIds.length === 0) {
-		ctx.ui.notify("至少填一个模型 ID。", "error");
+		ctx.ui.notify("至少保留一个模型 ID。", "error");
 		return undefined;
 	}
 
+	saveRelayState({ lastBaseUrl: baseUrl, lastApi: api });
 	return { id, baseUrl, api, apiKey, modelIds };
 }
 
@@ -563,30 +703,13 @@ async function cmdTest(_pi: ExtensionAPI, args: string, ctx: ExtensionCommandCon
 		ctx.ui.notify(`找不到 ${id}。`, "error");
 		return;
 	}
-	const key = resolveKeyForTest(entry.apiKey);
-	const headers: Record<string, string> = {};
-	if (key) headers["Authorization"] = `Bearer ${key}`;
-	let url = "";
-	try {
-		url = `${entry.baseUrl.replace(/\/+$/, "")}/models`;
-		const res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
-		const text = await res.text();
-		if (res.ok) {
-			let count = "(解析失败)";
-			try {
-				const data = JSON.parse(text) as { data?: unknown[] };
-				if (Array.isArray(data.data)) count = `${data.data.length} 个模型`;
-			} catch {
-				// 非 OpenAI 格式也算通
-			}
-			ctx.ui.notify(`连通 OK：${id} → ${count}`, "info");
-		} else if (res.status === 404) {
-			ctx.ui.notify(`${id} 地址可达，但无 /models 端点（Anthropic 兼容属正常），请直接 /model 试用。`, "warning");
-		} else {
-			ctx.ui.notify(`连通失败：HTTP ${res.status} ${text.slice(0, 200)}`, "error");
-		}
-	} catch (err) {
-		ctx.ui.notify(`连通失败：${url || entry.baseUrl}（${err instanceof Error ? err.message : String(err)}）`, "error");
+	const fetched = await fetchModelIds(entry.baseUrl, entry.api, entry.apiKey);
+	if (fetched.ok) {
+		ctx.ui.notify(`连通 OK：${id} → ${fetched.ids.length} 个模型（${fetched.ids.slice(0, 5).join(", ")}${fetched.ids.length > 5 ? "…" : ""}）`, "info");
+	} else if (fetched.error?.includes("404")) {
+		ctx.ui.notify(`${id} 地址可达，但无 /models 端点（Anthropic 兼容属正常），请直接 /model 试用。`, "warning");
+	} else {
+		ctx.ui.notify(`连通失败：${fetched.error}`, "error");
 	}
 }
 
