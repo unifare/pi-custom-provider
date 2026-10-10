@@ -1,4 +1,6 @@
-# pi-relay-tui — 方案 (PLAN)
+# pi-custom-provider — 方案 (PLAN)
+
+> 2026-10-10 决策冻结：包名 `pi-custom-provider`；api 7 选 1 全给；允许明文（二次确认）；MVP 只做 global。
 
 > 目标：**在 Pi 的 TUI 里配好自定义中转 API**，全程 `select / input / confirm`，零手动改文件。
 
@@ -73,9 +75,10 @@ pi-relay-tui/
 
 ## 7. 里程碑
 
-- [x] M0：建仓 + 方案冻结（今天）
-- [ ] M1：`/relay-add /relay-list` + 真机 `pi --extension` 验证 + `/model` 能选到
-- [ ] M2：`edit / del / test / use` + 脱敏 + 备份
+- [x] M0：建仓 + 方案冻结
+- [x] M1：`/relay /relay-add /relay-list /relay-use /relay-del /relay-test` 实现 + 类型检查 + headless 功能测试（见 test/）
+- [ ] M1-verify：真机 `pi --extension` 走一遍向导 + `/model` 能选到（等你验证）
+- [ ] M2：`edit`（改 baseUrl/key/模型）、`/models` 发现、失败重试指引 polish
 - [ ] M3：`pi install git:...` 发布验证 + README 录屏
 - [ ] M4（可选）：转方案 B（动态注册 + `/models` 发现 + auth.json 联动）
 
