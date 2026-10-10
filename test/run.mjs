@@ -230,16 +230,15 @@ await ok("normalizeApiKeyInput 自动识别", async () => {
 	assert.ok(relay.normalizeApiKeyInput("  ").error);
 });
 
-await ok("TUI 向导：自动拉取 + env key", async () => {
+await ok("TUI 向导：自动拉取 + env key + 全选", async () => {
 	const dir = freshDir();
 	const pi = makePi();
 	relay.default(pi);
-	// inputs: 名字 / baseUrl / key；selects: api 第 0 个；editor 空=直接用拉取结果；confirms: 保存确认
+	// inputs: 名字 / baseUrl / key；selects: api[0] → 模型[0] → 动作[1 全选]；confirms: 保存确认
 	const { ctx } = makeCtx(pi, {
 		uiQueue: {
 			inputs: ["wiz", `${stubBase}/v1`, "$MY_WIZ_KEY"],
-			selects: [0],
-			editor: [],
+			selects: [0, 0, 1],
 			confirms: [true],
 		},
 	});
@@ -251,6 +250,44 @@ await ok("TUI 向导：自动拉取 + env key", async () => {
 		["auto-1", "auto-2"],
 	);
 	assert.equal(relay.loadRelayState(dir).lastBaseUrl, `${stubBase}/v1`);
+});
+
+await ok("直接回车默认第一个（两次回车即完成）", async () => {
+	freshDir();
+	const pi = makePi();
+	relay.default(pi);
+	// selects: api[0] → 模型直接回车(auto-1) → 动作直接回车(就这 1 个)
+	const { ctx } = makeCtx(pi, {
+		uiQueue: {
+			inputs: ["one", `${stubBase}/v1`, "plain-k"],
+			selects: [0, 0, 0],
+			confirms: [true, true],
+		},
+	});
+	await pi.commands["relay-add"].handler("", ctx);
+	assert.deepEqual(
+		readModels(process.env.PI_TEST_AGENT_DIR).providers["relay-one"].models.map((m) => m.id),
+		["auto-1"],
+	);
+});
+
+await ok("多选：挑第 2 个再继续选第 1 个", async () => {
+	freshDir();
+	const pi = makePi();
+	relay.default(pi);
+	// selects: api[0] → 模型[1 auto-2] → 动作[2 继续选] → rest[0 auto-1] → 动作[0 完成]
+	const { ctx } = makeCtx(pi, {
+		uiQueue: {
+			inputs: ["multi", `${stubBase}/v1`, "$K"],
+			selects: [0, 1, 2, 0, 0],
+			confirms: [true],
+		},
+	});
+	await pi.commands["relay-add"].handler("", ctx);
+	assert.deepEqual(
+		readModels(process.env.PI_TEST_AGENT_DIR).providers["relay-multi"].models.map((m) => m.id),
+		["auto-2", "auto-1"],
+	);
 });
 
 await ok("TUI 向导：拉取失败回落手动", async () => {

@@ -29,5 +29,5 @@ pi --extension ./extensions/relay.ts
 - 只管理 `relay-*` 命名空间，不碰内置 provider；写前备份 `models.json.bak`。
 - 接口类型 7 选 1：`openai-completions / openai-responses / anthropic-messages / google-generative-ai / google-vertex / azure-openai-responses / mistral-conversations`。
 - Key 一次输完自动识别：`$ENV` 引用（推荐）/ 明文（二次确认）/ `!command`。
-- 模型列表自动拉取（`GET {baseUrl}/models`，OpenAI/Gemini 格式），拉到后多行编辑器确认删减，拉不到回落手动填写；上次地址自动复用。
+- 模型列表自动拉取（`GET {baseUrl}/models`，OpenAI/Gemini 格式），拉到后列表确认：直接回车即第 1 个，还可继续多选 / 全选 / 手动追加；拉不到回落手动填写；上次地址自动复用。
 - 只读写 global（`~/.pi/agent/models.json`）。

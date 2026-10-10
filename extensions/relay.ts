@@ -469,7 +469,7 @@ async function wizardAdd(ctx: ExtensionCommandContext): Promise<RelayDraft | und
 	const apiKey = await inputApiKey(ctx);
 	if (!apiKey) return undefined;
 
-	// 自动拉取模型列表，拉到后用多行编辑器确认（可删减增补），拉不到回落手动填写
+	// 自动拉取模型列表，拉到后用列表确认（直接回车即第 1 个，可继续多选/全选），拉不到回落手动填写
 	let modelIds: string[];
 	if (ctx.mode === "tui") ctx.ui.notify("正在拉取模型列表…", "info");
 	const fetched = await fetchModelIds(baseUrl, api, apiKey);
@@ -477,12 +477,9 @@ async function wizardAdd(ctx: ExtensionCommandContext): Promise<RelayDraft | und
 		if (ctx.mode !== "tui") {
 			modelIds = fetched.ids;
 		} else {
-			const edited = await ctx.ui.editor("确认模型列表（一行一个，回车提交）", fetched.ids.join("\n"));
-			if (edited === undefined) {
-				ctx.ui.notify("已取消。", "info");
-				return undefined;
-			}
-			modelIds = parseModelIds(edited);
+			const confirmed = await confirmModels(ctx, fetched.ids);
+			if (!confirmed) return undefined;
+			modelIds = confirmed;
 		}
 	} else {
 		if (ctx.mode === "tui") {
@@ -502,6 +499,45 @@ async function wizardAdd(ctx: ExtensionCommandContext): Promise<RelayDraft | und
 
 	saveRelayState({ lastBaseUrl: baseUrl, lastApi: api });
 	return { id, baseUrl, api, apiKey, modelIds };
+}
+
+/**
+ * 列表确认模型：直接回车即第 1 个；之后可“就这几个 / 全选 / 继续多选 / 手动追加”。
+ * 任意一步 Esc 即取消整个新增（返回 undefined）。
+ */
+async function confirmModels(ctx: ExtensionCommandContext, fetchedIds: string[]): Promise<string[] | undefined> {
+	const first = await ctx.ui.select(`确认模型（共 ${fetchedIds.length} 个，直接回车取第 1 个）`, fetchedIds);
+	if (!first) {
+		ctx.ui.notify("已取消。", "info");
+		return undefined;
+	}
+	const picked: string[] = [first];
+	for (;;) {
+		const rest = fetchedIds.filter((id) => !picked.includes(id));
+		const options = [
+			`就这 ${picked.length} 个，完成`,
+			`全选（共 ${fetchedIds.length} 个）`,
+				...(rest.length > 0 ? [`继续选…（还剩 ${rest.length} 个）`] : []),
+				"手动输入…",
+		];
+		const act = await ctx.ui.select(`已选：${picked.join(", ")}`, options);
+		if (!act) {
+			ctx.ui.notify("已取消。", "info");
+			return undefined;
+		}
+		if (act.startsWith("就这")) return picked;
+		if (act.startsWith("全选")) return [...fetchedIds];
+		if (act.startsWith("继续选")) {
+			const more = await ctx.ui.select("继续选（直接回车取第 1 个）", rest);
+			if (more && !picked.includes(more)) picked.push(more);
+			continue;
+		}
+		const raw = await inputOrAbort(ctx, "模型 ID（逗号分隔，追加到已选）", "gpt-5.4");
+		if (!raw) continue;
+		for (const id of parseModelIds(raw)) {
+			if (!picked.includes(id)) picked.push(id);
+		}
+	}
 }
 
 function previewDraft(d: RelayDraft): string {
