@@ -1,0 +1,17 @@
+{
+  "name": "pi-relay-tui",
+  "version": "0.1.0",
+  "description": "Configure OpenAI/Anthropic-compatible relay endpoints from inside Pi TUI — no manual models.json editing.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions/relay.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
