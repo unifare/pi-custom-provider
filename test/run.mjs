@@ -230,29 +230,101 @@ await ok("normalizeApiKeyInput 自动识别", async () => {
 	assert.ok(relay.normalizeApiKeyInput("  ").error);
 });
 
-await ok("TUI 向导：自动拉取 + env key + 全选", async () => {
+await ok("suggestProviderId 按域名生成+去重", async () => {
+	assert.equal(relay.suggestProviderId("https://api.siliconflow.cn/v1", new Set()), "relay-siliconflow");
+	assert.equal(
+		relay.suggestProviderId("https://api.siliconflow.cn/v1", new Set(["relay-siliconflow"])),
+		"relay-siliconflow-2",
+	);
+	assert.equal(relay.suggestProviderId("http://localhost:11434/v1", new Set()), "relay-local");
+	assert.equal(relay.suggestProviderId("http://127.0.0.1:8080", new Set()), "relay-local");
+	assert.equal(relay.suggestProviderId("not a url", new Set()), "relay-custom");
+});
+
+await ok("findByBaseUrl / findEnvUsage", async () => {
 	const dir = freshDir();
 	const pi = makePi();
 	relay.default(pi);
-	// inputs: 名字 / baseUrl / key；selects: api[0] → 模型[0] → 动作[1 全选]；confirms: 保存确认
+	const { ctx } = makeCtx(pi, { mode: "print" });
+	await pi.commands["relay-add"].handler(
+		`--name a --baseUrl ${stubBase}/v1 --key $SHARE --models m`,
+		ctx,
+	);
+	const file = relay.loadModelsFile(dir);
+	assert.deepEqual(relay.findByBaseUrl(file, `${stubBase}/v1/`), ["relay-a"]);
+	assert.deepEqual(relay.findEnvUsage(file, "$SHARE"), ["relay-a"]);
+	assert.deepEqual(relay.findEnvUsage(file, "$OTHER"), []);
+	assert.deepEqual(relay.findEnvUsage(file, "plain"), []);
+});
+
+await ok("快速新增：只输地址和 Key（自动命名+模型全选）", async () => {
+	const dir = freshDir();
+	const pi = makePi();
+	relay.default(pi);
+	// inputs: baseUrl / key；无 select（默认接口+全选模型）；confirms: 保存确认 / 不再加
 	const { ctx } = makeCtx(pi, {
 		uiQueue: {
-			inputs: ["wiz", `${stubBase}/v1`, "$MY_WIZ_KEY"],
-			selects: [0, 0, 1],
-			confirms: [true],
+			inputs: [`${stubBase}/v1`, "$MY_WIZ_KEY"],
+			selects: [],
+			confirms: [true, false],
 		},
 	});
 	await pi.commands["relay-add"].handler("", ctx);
 	const file = readModels(dir);
-	assert.equal(file.providers["relay-wiz"].apiKey, "$MY_WIZ_KEY");
+	assert.equal(file.providers["relay-local"].api, "openai-completions");
+	assert.equal(file.providers["relay-local"].apiKey, "$MY_WIZ_KEY");
 	assert.deepEqual(
-		file.providers["relay-wiz"].models.map((m) => m.id),
+		file.providers["relay-local"].models.map((m) => m.id),
 		["auto-1", "auto-2"],
 	);
 	assert.equal(relay.loadRelayState(dir).lastBaseUrl, `${stubBase}/v1`);
 });
 
-await ok("直接回车默认第一个（两次回车即完成）", async () => {
+await ok("重复添加：同地址连加两次（仍然添加+自动-2）", async () => {
+	const dir = freshDir();
+	const pi = makePi();
+	relay.default(pi);
+	// 第一次 inputs[url,key] → 保存确认 → 再加一个确认 → 第二次 inputs[url,key2] → 同地址 select[仍然添加] → 保存确认 → 结束
+	const { ctx } = makeCtx(pi, {
+		uiQueue: {
+			inputs: [`${stubBase}/v1`, "$K1", `${stubBase}/v1`, "$K2"],
+			selects: [0],
+			confirms: [true, true, true, false],
+		},
+	});
+	await pi.commands["relay-add"].handler("", ctx);
+	const file = readModels(dir);
+	assert.ok(file.providers["relay-local"]);
+	assert.ok(file.providers["relay-local-2"]);
+	assert.equal(file.providers["relay-local-2"].apiKey, "$K2");
+});
+
+await ok("同名变量：第二个共用给出提示", async () => {
+	freshDir();
+	const pi = makePi();
+	relay.default(pi);
+	const { ctx } = makeCtx(pi, { mode: "print" });
+	await pi.commands["relay-add"].handler(`--name a --baseUrl ${stubBase}/v1 --key $SHARE --models m`, ctx);
+	const { ctx: ctx2, log } = makeCtx(pi, { mode: "print" });
+	await pi.commands["relay-add"].handler(`--name b --baseUrl ${stubBase}/gemini --key $SHARE --models m`, ctx2);
+	assert.ok(log.some((l) => l.message.includes("共用同一 Key")));
+});
+
+await ok("参数式缺省：只要 baseUrl+key（自动命名+拉模型）", async () => {
+	const dir = freshDir();
+	const pi = makePi();
+	relay.default(pi);
+	const { ctx } = makeCtx(pi, { mode: "print" });
+	await pi.commands["relay-add"].handler(`--baseUrl ${stubBase}/v1 --key k`, ctx);
+	const file = readModels(dir);
+	assert.ok(file.providers["relay-local"]);
+	assert.deepEqual(
+		file.providers["relay-local"].models.map((m) => m.id),
+		["auto-1", "auto-2"],
+	);
+});
+
+await ok("--custom 逐项向导仍可用（回车默认第一个模型）", async () => {
 	freshDir();
 	const pi = makePi();
 	relay.default(pi);
@@ -264,47 +336,28 @@ await ok("直接回车默认第一个（两次回车即完成）", async () => {
 			confirms: [true, true],
 		},
 	});
-	await pi.commands["relay-add"].handler("", ctx);
+	await pi.commands["relay-add"].handler("--custom", ctx);
 	assert.deepEqual(
 		readModels(process.env.PI_TEST_AGENT_DIR).providers["relay-one"].models.map((m) => m.id),
 		["auto-1"],
 	);
 });
 
-await ok("多选：挑第 2 个再继续选第 1 个", async () => {
-	freshDir();
-	const pi = makePi();
-	relay.default(pi);
-	// selects: api[0] → 模型[1 auto-2] → 动作[2 继续选] → rest[0 auto-1] → 动作[0 完成]
-	const { ctx } = makeCtx(pi, {
-		uiQueue: {
-			inputs: ["multi", `${stubBase}/v1`, "$K"],
-			selects: [0, 1, 2, 0, 0],
-			confirms: [true],
-		},
-	});
-	await pi.commands["relay-add"].handler("", ctx);
-	assert.deepEqual(
-		readModels(process.env.PI_TEST_AGENT_DIR).providers["relay-multi"].models.map((m) => m.id),
-		["auto-2", "auto-1"],
-	);
-});
-
-await ok("TUI 向导：拉取失败回落手动", async () => {
+await ok("快速新增拉取失败 → 降级手动填模型", async () => {
 	const dir = freshDir();
 	const pi = makePi();
 	relay.default(pi);
 	const { ctx, log } = makeCtx(pi, {
 		uiQueue: {
-			inputs: ["fb", "http://127.0.0.1:1", "plain-key-123", "m1,m2"],
+			inputs: ["http://127.0.0.1:1", "$K", "m1,m2"],
 			selects: [0],
-			confirms: [true, true],
+			confirms: [true, false],
 		},
 	});
 	await pi.commands["relay-add"].handler("", ctx);
-	assert.ok(log.some((l) => l.message.includes("自动获取失败")));
+	assert.ok(log.some((l) => l.message.includes("转自定义流程")));
 	assert.deepEqual(
-		readModels(dir).providers["relay-fb"].models.map((m) => m.id),
+		readModels(dir).providers["relay-local"].models.map((m) => m.id),
 		["m1", "m2"],
 	);
 });

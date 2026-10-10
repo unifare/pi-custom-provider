@@ -93,6 +93,50 @@ export function isValidEnvName(name: string): boolean {
 	return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
 }
 
+function hostCore(host: string): string {
+	const h = host.toLowerCase().split(":")[0];
+	if (/^[\d.]+$/.test(h) || h === "localhost" || h === "") return "local";
+	const labels = h.split(".").filter(Boolean);
+	if (labels.length >= 2) return labels[labels.length - 2];
+	return labels[0] ?? "custom";
+}
+
+/** 按域名自动生成 relay id（siliconflow.cn → relay-siliconflow），已占用自动加 -2/-3。 */
+export function suggestProviderId(baseUrl: string, taken: Set<string>): string {
+	let core = "custom";
+	try {
+		core = hostCore(new URL(baseUrl).hostname);
+	} catch {
+		// 非法 URL 由调用方校验，这里只管生成
+	}
+	const clean = core
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 24);
+	const base = `relay-${clean || "custom"}`;
+	if (!taken.has(base)) return base;
+	let n = 2;
+	while (taken.has(`${base}-${n}`)) n++;
+	return `${base}-${n}`;
+}
+
+/** 同一地址已被哪些 relay 用过（比较归一化后的 baseUrl）。 */
+export function findByBaseUrl(file: ModelsFileShape, baseUrl: string, exceptId?: string): string[] {
+	const norm = normalizeBaseUrl(baseUrl);
+	return Object.entries(file.providers ?? {})
+		.filter(([id, e]) => id !== exceptId && normalizeBaseUrl(e.baseUrl) === norm)
+		.map(([id]) => id);
+}
+
+/** 同一 $ENV 引用被哪些 relay 共用。 */
+export function findEnvUsage(file: ModelsFileShape, envRef: string, exceptId?: string): string[] {
+	if (!envRef.startsWith("$")) return [];
+	return Object.entries(file.providers ?? {})
+		.filter(([id, e]) => id !== exceptId && e.apiKey === envRef)
+		.map(([id]) => id);
+}
+
 export function maskKey(key: string | undefined): string {
 	if (!key) return "(未设置)";
 	if (key.startsWith("$")) return `(${key} 引用环境变量)`;
@@ -550,64 +594,162 @@ function previewDraft(d: RelayDraft): string {
 	].join("\n");
 }
 
-async function saveDraft(pi: ExtensionAPI, ctx: ExtensionCommandContext, d: RelayDraft): Promise<void> {
-	await writeRelayProvider(d.id, {
+async function saveDraft(pi: ExtensionAPI, ctx: ExtensionCommandContext, d: RelayDraft, note?: string): Promise<void> {
+	const entry = {
 		baseUrl: d.baseUrl,
 		api: d.api,
 		apiKey: d.apiKey,
 		models: d.modelIds.map((id) => ({ id })),
-	});
-	registerDynamic(pi, d.id, {
-		baseUrl: d.baseUrl,
-		api: d.api,
-		apiKey: d.apiKey,
-		models: d.modelIds.map((id) => ({ id })),
-	});
-	ctx.ui.notify(`已保存 ${d.id}。去 /model 选择 ${d.id}/${d.modelIds[0]} 即可使用。`, "info");
+	};
+	await writeRelayProvider(d.id, entry);
+	registerDynamic(pi, d.id, entry);
+	ctx.ui.notify(`已保存 ${d.id}。去 /model 选择 ${d.id}/${d.modelIds[0]} 即可使用。${note ?? ""}`, "info");
+}
+
+/** $ENV 被多个 relay 共用时的提示（只存引用所以允许共用，不阻断）。 */
+function envShareNote(file: ModelsFileShape, apiKey: string): string {
+	const users = findEnvUsage(file, apiKey);
+	return users.length > 0 ? `注：${apiKey} 已被 ${users.join("、")} 在用，将共用同一 Key；不同 Key 请换变量名。` : "";
+}
+
+/**
+ * 快速新增：只输地址和 Key，其余全默认/自动——
+ * 名字按域名自动生成（重复自动 -2/-3）、接口默认 openai-completions、模型自动全拉。
+ * 非 OpenAI 兼容（拉不到列表）自动降级进自定义流程。返回 true 表示成功加了一个。
+ */
+async function quickAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<boolean> {
+	const remembered = loadRelayState();
+	const rawUrl = await inputOrAbort(ctx, "Base URL（中转地址）", remembered.lastBaseUrl ?? "https://api.example.com/v1");
+	if (!rawUrl) return false;
+	const baseUrl = normalizeBaseUrl(rawUrl);
+	if (!isValidBaseUrl(baseUrl)) {
+		ctx.ui.notify(`URL 不合法：${baseUrl}`, "error");
+		return false;
+	}
+
+	// 同一地址已配过 → 给出路，不直接报错
+	const dups = findByBaseUrl(loadModelsFile(), baseUrl);
+	if (dups.length > 0) {
+		const choice = await ctx.ui.select(`该地址已被 ${dups.join("、")} 使用`, [
+			"仍然添加",
+			`切换到 ${dups[0]}`,
+			"取消",
+		]);
+		if (!choice || choice === "取消") {
+			ctx.ui.notify("已取消。", "info");
+			return false;
+		}
+		if (choice.startsWith("切换到")) {
+			await cmdUse(pi, dups[0], ctx);
+			return false;
+		}
+	}
+
+	const apiKey = await inputApiKey(ctx);
+	if (!apiKey) return false;
+
+	const DEFAULT_API = "openai-completions";
+	ctx.ui.notify("正在识别接口并拉取模型列表…", "info");
+	let api = DEFAULT_API;
+	let modelIds: string[];
+	const fetched = await fetchModelIds(baseUrl, DEFAULT_API, apiKey);
+	if (fetched.ok && fetched.ids.length > 0) {
+		modelIds = fetched.ids;
+	} else {
+		// 非 OpenAI 兼容 → 降级：选接口 + 按该接口再拉一次 → 还不行就手动填
+		ctx.ui.notify(`自动识别失败（${fetched.error ?? "无数据"}），转自定义流程。`, "warning");
+		const customApi = await pickApi(ctx, remembered.lastApi);
+		if (!customApi) return false;
+		api = customApi;
+		const retry = await fetchModelIds(baseUrl, api, apiKey);
+		if (retry.ok && retry.ids.length > 0) {
+			const confirmed = await confirmModels(ctx, retry.ids);
+			if (!confirmed) return false;
+			modelIds = confirmed;
+		} else {
+			const rawModels = await inputOrAbort(ctx, "模型 ID（逗号分隔）", "gpt-5.4");
+			if (!rawModels) return false;
+			modelIds = parseModelIds(rawModels);
+			if (modelIds.length === 0) {
+				ctx.ui.notify("至少填一个模型 ID。", "error");
+				return false;
+			}
+		}
+	}
+
+	const file = loadModelsFile();
+	const id = suggestProviderId(baseUrl, new Set(Object.keys(file.providers ?? {})));
+	const draft: RelayDraft = { id, baseUrl, api, apiKey, modelIds };
+	const note = envShareNote(file, apiKey);
+	const ok = await ctx.ui.confirm("确认保存？", note ? `${previewDraft(draft)}\n${note}` : previewDraft(draft));
+	if (!ok) {
+		ctx.ui.notify("已取消。", "info");
+		return false;
+	}
+	await saveDraft(pi, ctx, draft);
+	saveRelayState({ lastBaseUrl: baseUrl, lastApi: api });
+	return true;
 }
 
 async function cmdAdd(pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
 	const opts = parseArgs(args);
-	const hasAll = opts["name"] && opts["baseUrl"] && opts["api"] && opts["key"] && opts["models"];
-
-	// 参数不全 → TUI 向导
-	if (!hasAll) {
+	// 参数不够（缺 baseUrl/key）→ TUI 向导：--custom 进逐项版，否则快速新增
+	const hasMin = opts["baseUrl"] && opts["key"];
+	if (!hasMin) {
 		if (opts["help"] || !requireTui(ctx)) {
 			if (opts["help"] || ctx.mode !== "tui") {
 				ctx.ui.notify(
-					"用法 /relay-add --name X --baseUrl URL --api openai-completions --key KEY --models a,b（TUI 下直接运行进入向导）",
+					"用法 /relay-add --baseUrl URL --key KEY [--api openai-completions] [--models a,b] [--name X]（TUI 下直接运行进入快速新增，可连加；--custom 进逐项向导）",
 					"info",
 				);
 			}
 			return;
 		}
-		const draft = await wizardAdd(ctx);
-		if (!draft) return;
-		const ok = await ctx.ui.confirm("确认保存？", previewDraft(draft));
-		if (!ok) {
-			ctx.ui.notify("已取消。", "info");
+		// --custom 进逐项向导；否则 TUI 快速新增（可连加）
+		if (opts["custom"]) {
+			const draft = await wizardAdd(ctx);
+			if (!draft) return;
+			const note = envShareNote(loadModelsFile(), draft.apiKey);
+			const ok = await ctx.ui.confirm("确认保存？", note ? `${previewDraft(draft)}\n${note}` : previewDraft(draft));
+			if (!ok) {
+				ctx.ui.notify("已取消。", "info");
+				return;
+			}
+			await saveDraft(pi, ctx, draft);
 			return;
 		}
-		await saveDraft(pi, ctx, draft);
+		for (;;) {
+			const added = await quickAdd(pi, ctx);
+			if (!added) break;
+			const more = await ctx.ui.confirm("再加一个？", "继续添加下一个中转（地址可沿用上次）。");
+			if (!more) break;
+		}
 		return;
 	}
 
-	// 参数式（非 TUI 也可用）
-	const id = normalizeProviderId(String(opts["name"]));
+	// 参数式（非 TUI 也可用）：只要求 baseUrl + key，其余默认/自动
 	const baseUrl = normalizeBaseUrl(String(opts["baseUrl"]));
-	const api = String(opts["api"]);
-	const modelIds = parseModelIds(String(opts["models"]));
-	if (!isValidProviderId(id)) throw new Error(`非法名字：${id}`);
 	if (!isValidBaseUrl(baseUrl)) throw new Error(`非法 URL：${baseUrl}`);
+	const api = opts["api"] ? String(opts["api"]) : "openai-completions";
 	if (!API_VALUES.has(api)) throw new Error(`非法 api：${api}（可选 ${[...API_VALUES].join(" / ")}）`);
-	if (modelIds.length === 0) throw new Error("models 为空");
-	await saveDraft(pi, ctx, {
-		id,
-		baseUrl,
-		api,
-		apiKey: String(opts["key"]),
-		modelIds,
-	});
+	const parsedKey = normalizeApiKeyInput(String(opts["key"]));
+	if (!parsedKey.key) throw new Error(parsedKey.error ?? "非法 key");
+	let modelIds = opts["models"] ? parseModelIds(String(opts["models"])) : [];
+	if (modelIds.length === 0) {
+		const fetched = await fetchModelIds(baseUrl, api, parsedKey.key);
+		if (!fetched.ok || fetched.ids.length === 0) {
+			throw new Error(`拉不到模型列表（${fetched.error ?? "无数据"}），请用 --models 指定`);
+		}
+		modelIds = fetched.ids;
+	}
+	const file = loadModelsFile();
+	const id = opts["name"]
+		? normalizeProviderId(String(opts["name"]))
+		: suggestProviderId(baseUrl, new Set(Object.keys(file.providers ?? {})));
+	if (!isValidProviderId(id)) throw new Error(`非法名字：${id}`);
+	if (file.providers?.[id]) throw new Error(`${id} 已存在（参数式不自动改名，请换 --name）`);
+	await saveDraft(pi, ctx, { id, baseUrl, api, apiKey: parsedKey.key, modelIds }, envShareNote(file, parsedKey.key));
+	saveRelayState({ lastBaseUrl: baseUrl, lastApi: api });
 }
 
 async function pickRelay(ctx: ExtensionCommandContext, title: string): Promise<string | undefined> {
@@ -762,7 +904,8 @@ export default function relayExtension(pi: ExtensionAPI) {
 				return;
 			}
 			const action = await ctx.ui.select("中转管理", [
-				"add — 新增中转（向导）",
+				"add — 快速新增（只输地址和 Key，可连加）",
+				"custom — 自定义新增（命名 / 接口 / 逐个选模型）",
 				"list — 列表 / 切换 / 测试 / 删除",
 				"use — 切换到某中转模型",
 				"test — 测连通性",
@@ -770,7 +913,8 @@ export default function relayExtension(pi: ExtensionAPI) {
 			]);
 			if (!action) return;
 			const verb = action.split(" — ")[0];
-			if (verb === "add") await cmdAdd(pi, args, ctx);
+			if (verb === "add") await cmdAdd(pi, "", ctx);
+			else if (verb === "custom") await cmdAdd(pi, "--custom", ctx);
 			else if (verb === "list") await cmdList(pi, args, ctx);
 			else if (verb === "use") await cmdUse(pi, args, ctx);
 			else if (verb === "test") await cmdTest(pi, args, ctx);
@@ -779,7 +923,7 @@ export default function relayExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("relay-add", {
-		description: "新增自定义中转（TUI 向导 / 参数式）",
+		description: "快速新增中转（默认全自动；--custom 逐项控制）",
 		handler: async (args, ctx) => cmdAdd(pi, args, ctx),
 	});
 

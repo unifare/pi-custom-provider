@@ -29,17 +29,17 @@ pi --extension ./extensions/relay.ts
 ## 快速上手
 
 ```text
-/relay-add
-# 1. 中转名字（自动加 relay- 前缀，如 my-relay → relay-my-relay）
-# 2. Base URL（第二次起可直接回车沿用上次）
-# 3. 接口类型（7 选 1，见下表，回车即第一个）
-# 4. API Key（$MY_KEY / 明文 / !command 一次输完自动识别）
-# 5. 模型列表自动拉取 → 直接回车取第 1 个，或继续多选 / 全选
-# 6. 脱敏预览确认 → 保存
-
-/model
-# 选到 relay-my-relay/xxx，开用
+/relay-add          # 快速新增：只输 Base URL 和 Key（2 步 + 1 确认），名字按域名自动生成
+                    # 接口默认 openai-completions，模型自动全拉；结束问“再加一个？”可连加
+/relay-add --custom # 逐项控制：命名 / 接口 7 选 1 / 逐个选模型
+/model              # 选到 relay-siliconflow/xxx，开用
 ```
+
+同名冲突策略：
+
+- **同地址重复添加**：不报错，给三条路——`仍然添加`（名字自动 `relay-xxx-2`）、`切换到已有的`、`取消`。
+- **同名 `$ENV` 变量**：允许共用（只存引用不存值），保存时提示“已被 relay-a 在用，将共用同一 Key”；要不同 Key 就换个变量名。
+- **同 provider id**：快速新增自动加 `-2/-3` 后缀；参数式要求换 `--name`。
 
 ## 接口类型
 

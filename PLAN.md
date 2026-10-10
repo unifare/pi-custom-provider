@@ -79,7 +79,9 @@ pi-relay-tui/
 - [x] M1：`/relay /relay-add /relay-list /relay-use /relay-del /relay-test` 实现 + 类型检查 + headless 功能测试（见 test/）
 - [x] M1-verify：真机 `pi --extension` 走通（用户确认可用，反馈“过程繁琐、无自动获取”）
 - [x] M2：`/models` 自动拉取 + 向导瘦身（Key 一次输入自动识别、上次地址复用、模型编辑器确认）+ `/relay-test` 复用同一拉取逻辑
-- [ ] M3：`edit`（改 baseUrl/key/模型）、`pi install git:` 发布验证
+- [x] M3：快速新增（2 输入+1 确认：自动命名/默认接口/模型全拉）+ 连加循环 + 同地址/同变量冲突策略 + 参数式缺省（--custom 保留逐项版）
+- [x] 发布：https://github.com/unifare/pi-custom-provider（public）
+- [ ] M4（可选）：`/relay-edit`（改 Key/增减模型不删重加）
 - [ ] M3：`pi install git:...` 发布验证 + README 录屏
 - [ ] M4（可选）：转方案 B（动态注册 + `/models` 发现 + auth.json 联动）
 
